@@ -1,5 +1,9 @@
 import { Edit, Sparkles } from 'lucide-react'
 import React, { useState } from 'react'
+import axios from 'axios'
+import { useAuth } from '@clerk/clerk-react';
+
+axios.defaults.baseURL=import.meta.env.VITE_BASE_URL;
 
 const Article=()=> {
 
@@ -12,9 +16,39 @@ const Article=()=> {
 
   const [selectedLength, setSelectedLength] = useState(articleLength[0].length);
   const [input,setInput]=useState('')
-  const onSubmitHandler=(e)=>{
+  const [loading,setLoading]=useState(false)
+  const [content , setContent]=useState('')
+
+  const {getToken}=useAuth();
+ const onSubmitHandler= async(e)=>{
     e.preventDefault();
+
+    try{
+      setLoading(true);
+      const prompt=`write a detailed article about ${input} with a length of around ${selectedLength.length} words. 
+      Make sure the article is informative, engaging, and well-structured. Use subheadings, bullet points, and examples where appropriate to enhance readability. 
+      The tone should be professional yet accessible, catering to a broad audience interested in the topic. 
+      Conclude the article with a summary of key points and a call to action or further reading suggestions.`
+
+      const {data}= await axios.post('/api/ai/Create-Article',{prompt,length:selectedLength.length},{
+        headers:{ Authorization: `Bearer ${await getToken()}`}})
+
+        if(data.success){
+          setContent(data.content)
+        }
+            else{
+              toast.error(data.message)
+            }
+          
+
+    }
+  
+  catch(error){
+      toast.error(error.message)
+    }
+    setLoading(false)
   }
+  
 
   
   return (

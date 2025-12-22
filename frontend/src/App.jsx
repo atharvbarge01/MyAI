@@ -12,6 +12,7 @@ import ResumeAnalysis from './pages/ResumeAnalysis.jsx'
 import Removebg from './pages/Removebg.jsx'
 import { useAuth } from '@clerk/clerk-react'
 import { useEffect } from 'react'
+import {Toaster} from 'react-hot-toast'
 
 function App() {
 
@@ -26,6 +27,7 @@ function App() {
       },[]);
   return (
     <div>
+      <Toaster />
       <Routes>
         <Route path="/" element={<Homepage />}/>
         <Route path="/MyAI" element={<Layout />}>
