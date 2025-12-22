@@ -19,8 +19,12 @@ export const auth = async (req, res, next) => {
         // }
 
         // req.plan = hasPremiumPlan ? 'premium' : 'free';
-        await req.auth();
-        req.plan='free';
+        const authRes = await req.auth?.();
+        const userId = authRes?.userId;
+        if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+        req.userId = userId;
+        req.plan = 'free';
         req.free_usage = 0;
         next();
 
