@@ -1,222 +1,230 @@
 import OpenAI from "openai";
 import sql from "../configs/db.js";
-import axios from 'axios';
-import FormData from 'form-data';
-import { v2 as cloudinary } from 'cloudinary';
+import axios from "axios";
+import FormData from "form-data";
+import { v2 as cloudinary } from "cloudinary";
 import fs from "fs";
-import pdf from "pdf-parse/lib/pdf-parse.js";
+import pdf from "pdf-parse-fork";
 
+console.log('GEMINI key present:', !!process.env.GEMINI_API_KEY);
+// Optional Gemini OpenAI-compatible client (kept for future use)
 const ai = new OpenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  apiKey: process.env.GEMINI_API_KEY,
+  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
 });
+
+const getUserId = async (req) => req.userId ?? (await req.auth?.())?.userId;
+const useOpenAI = () => !!process.env.OPENAI_API_KEY;
+
+// Direct Gemini REST call (recommended path when OpenAI key is not set)
+const callGemini = async ({ prompt, maxTokens }) => {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY not configured");
+  }
+
+  // Use v1beta for gemini-2.0-flash
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const { data } = await axios.post(url, {
+    contents: [
+      {
+        parts: [{ text: prompt }],
+      },
+    ],
+    generationConfig: {
+      maxOutputTokens: maxTokens,
+      temperature: 0.7,
+    },
+  });
+
+  // Check if response was cut off
+  const candidate = data?.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  if (finishReason && finishReason !== 'STOP') {
+    console.warn(`Gemini finishReason: ${finishReason} (may indicate truncation)`);
+  }
+
+  const parts = candidate?.content?.parts || [];
+  const text = parts.map((p) => p.text || "").join("\n");
+  return text || JSON.stringify(data);
+};
+
+const runChat = async ({ prompt, maxTokens }) => {
+  if (useOpenAI()) {
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const response = await client.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.7,
+      max_tokens: maxTokens,
+    });
+    return response?.choices?.[0]?.message?.content ?? JSON.stringify(response);
+  }
+
+  // Fallback to direct Gemini REST
+  return await callGemini({ prompt, maxTokens });
+};
+
+const withinLimit = (req) => !(req.plan === "free" && req.free_usage >= 10);
+
+// Rough converter from requested word length to token limit
+// Using 6x multiplier to ensure full articles (accounts for markdown, formatting, etc.)
+const wordsToTokens = (length) => {
+  const n = parseInt(length, 10);
+  if (!Number.isFinite(n) || n <= 0) return 1200;
+  // 6 tokens per word gives headroom for formatting, markdown, etc.
+  return Math.min(8192, Math.max(800, n * 6));
+};
 
 export const generateArticle = async (req, res) => {
-    try{
-        const userId = req.userId ?? (await req.auth?.())?.userId;
-        console.log('generateArticle userId:', userId);
-        if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized: user not authenticated' });
-        const { prompt, length } = req.body ?? {};
-        if (!prompt) return res.status(400).json({ success: false, message: 'Missing prompt in request body' });
-        const plan =req.plan;
-        const free_usage = req.free_usage;
+  try {
+    const userId = await getUserId(req);
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
 
+    const { prompt, length } = req.body ?? {};
+    if (!prompt) return res.status(400).json({ success: false, message: "Missing prompt" });
+    if (!withinLimit(req)) return res.json({ success: false, message: "Free usage limit exceeded" });
 
-        if(plan==='free' && free_usage>=10){
-            return res.json({success:false,message:'Free usage limit exceeded'});
-        }
-
-        const response = await ai.chat.completions.create({
-    model: "gemini-2.0-flash",
-    messages: [
-        {
-            role: "user",
-            content: prompt,
-        },
-    ],
-    temperature: 0.7,
-    max_tokens: parseInt(length),
-});
-console.log("--- Gemini API Response Received ---"); 
-const content = response.choices[0].message.content;
-
-await sql `INSERT INTO creations (user_id,  prompt, content,type) VALUES (${userId},  ${prompt}, ${content},'article')`;
-
-res.json({success:true,content});
-
-    }catch(error){
-        console.error("Error generating article:", error);
-        return res.status(500).json({ success: false, message: "An error occurred: " + error.message });
-    
-        
-        }
+    const maxTokens = wordsToTokens(length);
+    let content;
+    try {
+      content = await runChat({ prompt, maxTokens });
+    } catch (err) {
+      console.error("generateArticle model failed, using fallback:", err?.response?.data || err);
+      content = `Article on ${prompt}\n\n${"• " + prompt}\n\n(This was generated by fallback because the model call failed.)`;
     }
 
+    await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, ${prompt}, ${content}, 'article')`;
+    return res.json({ success: true, content });
+  } catch (error) {
+    console.error("generateArticle failed:", error?.response?.data || error);
+    const msg = error?.response?.data?.error?.message || error?.message || "Unknown error";
+    return res.status(500).json({ success: false, message: "Model call failed: " + msg });
+  }
+};
 
 export const generateBlog = async (req, res) => {
-    try{
-        const userId = req.userId ?? (await req.auth?.())?.userId;
-        console.log('generateBlog userId:', userId);
-        if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized: user not authenticated' });
-        const { prompt } = req.body ?? {};
-        if (!prompt) return res.status(400).json({ success: false, message: 'Missing prompt in request body' });
-        const plan =req.plan;
-        const free_usage = req.free_usage;
+  try {
+    const userId = await getUserId(req);
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
 
+    const { prompt, length } = req.body ?? {};
+    if (!prompt) return res.status(400).json({ success: false, message: "Missing prompt" });
+    if (!withinLimit(req)) return res.json({ success: false, message: "Free usage limit exceeded" });
 
-        if(plan==='free' && free_usage>=10){
-            return res.json({success:false,message:'Free usage limit exceeded'});
-        }
-
-        const response = await ai.chat.completions.create({
-    model: "gemini-2.0-flash",
-    messages: [
-        {
-            role: "user",
-            content: prompt,
-        },
-    ],
-    temperature: 0.7,
-    max_tokens: 500,
-});
-console.log("--- Gemini API Response Received ---"); 
-const content = response.choices[0].message.content;
-
-await sql `INSERT INTO creations (user_id,  prompt, content,type) VALUES (${userId},  ${prompt}, ${content},'blog')`;
-
-res.json({success:true,content});
-
-    }catch(error){
-        console.error("Error generating article:", error);
-        return res.status(500).json({ success: false, message: "An error occurred: " + error.message });
-    
-        
-        }
+    let content;
+    try {
+      const maxTokens = wordsToTokens(length || 400);
+      content = await runChat({ prompt, maxTokens });
+    } catch (err) {
+      console.error("generateBlog model failed, using fallback:", err?.response?.data || err);
+      content = `Blog on ${prompt}\n\n- ${prompt}\n\n(Fallback content due to model error.)`;
     }
 
+    await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, ${prompt}, ${content}, 'blog')`;
+    return res.json({ success: true, content });
+  } catch (error) {
+    const msg = error?.response?.data?.error?.message || error?.message || "Unknown error";
+    return res.status(500).json({ success: false, message: "Model call failed: " + msg });
+  }
+};
 
 export const generateImage = async (req, res) => {
-    try{
-        const userId = req.userId ?? (await req.auth?.())?.userId;
-        console.log('generateImage userId:', userId);
-        if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized: user not authenticated' });
-        const { prompt, publish } = req.body ?? {};
-        if (!prompt) return res.status(400).json({ success: false, message: 'Missing prompt in request body' });
-        const plan =req.plan;
-        const free_usage = req.free_usage;
+  try {
+    const userId = await getUserId(req);
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
 
+    const { prompt, publish } = req.body ?? {};
+    if (!prompt) return res.status(400).json({ success: false, message: "Missing prompt" });
+    if (!withinLimit(req)) return res.json({ success: false, message: "Free usage limit exceeded" });
 
-        if(plan==='free' && free_usage>=10){
-            return res.json({success:false,message:'Free usage limit exceeded'});
-        }
+    console.log('Generating image with prompt:', prompt);
+    const formData = new FormData();
+    formData.append("prompt", prompt);
 
-        const formData = new FormData();
-        formData.append('prompt', prompt);
-        const { data } = await axios.post("https://clipdrop-api.co/text-to-image/v1", formData, {
-            headers: {
-                'x-api-key': process.env.CLIPDROP_API_KEY,
-                ...formData.getHeaders?.(),
-            },
-            responseType: 'arraybuffer'
-        });
+    console.log('Calling Clipdrop API...');
+    const { data } = await axios.post("https://clipdrop-api.co/text-to-image/v1", formData, {
+      headers: { "x-api-key": process.env.CLIPDROP_API_KEY, ...formData.getHeaders?.() },
+      responseType: "arraybuffer",
+    });
+    console.log('Clipdrop response received, size:', data.length);
 
-        const base64Image = `data:image/png;base64,${Buffer.from(data, 'binary').toString('base64')}`;
+    console.log('Uploading to Cloudinary (Stream)...');
 
-        
-   const {secure_url} = await cloudinary.uploader.upload(base64Image)
+    // Helper to upload buffer directly
+    const uploadFromBuffer = (buffer) => {
+      return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { timeout: 120000 },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result);
+          }
+        );
+        stream.end(buffer);
+      });
+    };
 
-await sql `INSERT INTO creations (user_id,  prompt, content,type,publish) VALUES (${userId},  ${prompt}, ${secure_url},'image',${publish ?? false})`;
+    const { secure_url } = await uploadFromBuffer(data);
+    console.log('Cloudinary upload successful:', secure_url);
 
-res.json({success:true,content:secure_url});
-
-    }catch(error){
-        console.error("Error generating article:", error);
-        return res.status(500).json({ success: false, message: "An error occurred: " + error.message });
-    
-        
-        }
+    await sql`INSERT INTO creations (user_id, prompt, content, type, publish) VALUES (${userId}, ${prompt}, ${secure_url}, 'image', ${publish ?? false})`;
+    return res.json({ success: true, content: secure_url });
+  } catch (error) {
+    console.error("GenerateImage detailed error:", error);
+    const msg = error?.response?.data?.error?.message || error?.message || JSON.stringify(error) || "Unknown error";
+    // Check for specific Cloudinary or Axios codes
+    if (error?.code === 'ECONNRESET') {
+      return res.status(500).json({ success: false, message: "Network connection reset (unstable internet). Please try again." });
     }
-
+    return res.status(500).json({ success: false, message: "Image generation failed: " + msg });
+  }
+};
 
 export const removeBackgroundofImage = async (req, res) => {
-    try{
-        const{userId}=req.auth();
-        const{image}=req.file;
-        const plan =req.plan;
-        const free_usage = req.free_usage;
+  try {
+    const userId = await getUserId(req);
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const { image } = req.file;
+    if (!withinLimit(req)) return res.json({ success: false, message: "Free usage limit exceeded" });
 
+    const { secure_url } = await cloudinary.uploader.upload(image.path, {
+      transformation: [{ effect: "background_removal", background_removal: "remove the background" }],
+      timeout: 120000
+    });
 
-        if(plan==='free' && free_usage>=10){
-            return res.json({success:false,message:'Free usage limit exceeded'});
-        }
-
-       const {secure_url}= await cloudinary.uploader.upload(image.path , {
-        transformation:[
-            {
-                effect: 'background_removal',
-                background_removal:'remove the background'
-            }
-        ]
-       })
-
-await sql `INSERT INTO creations (user_id,  prompt, content,type) VALUES (${userId},  "Remove background from image", ${secure_url},'image')`;
-
-res.json({success:true,content});
-
-    }catch(error){
-        console.error("Error generating article:", error);
-        return res.status(500).json({ success: false, message: "An error occurred: " + error.message });
-    
-        
-        }
-    }
+    await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, 'Remove background from image', ${secure_url}, 'image')`;
+    return res.json({ success: true, content: secure_url });
+  } catch (error) {
+    const msg = error?.response?.data?.error?.message || error?.message || "Unknown error";
+    return res.status(500).json({ success: false, message: "Background removal failed: " + msg });
+  }
+};
 
 export const resumeAnalysis = async (req, res) => {
-    try{
-        const{userId}=req.auth();
-        const resume=req.file;
-        const plan =req.plan;
-        const free_usage = req.free_usage;
+  try {
+    const userId = await getUserId(req);
+    if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+    const resume = req.file;
+    if (!resume) return res.status(400).json({ success: false, message: "Resume file missing" });
+    if (!withinLimit(req)) return res.json({ success: false, message: "Free usage limit exceeded" });
+    if (resume.size > 6 * 1024 * 1024) return res.json({ success: false, message: "the file exceeds the limit of 6MB" });
 
+    const dataBuffer = fs.readFileSync(resume.path);
+    const pdfData = await pdf(dataBuffer);
+    const prompt = `Analyze the following resume and provide constructive feedback on its strengths, weaknesses, and areas for improvement. Resume content: ${pdfData.text}`;
 
-        if(plan==='free' && free_usage>=10){
-            return res.json({success:false,message:'Free usage limit exceeded'});
-        }
-
-      if(resume.size > 6 * 1024* 1024){
-        return res.json({sucess:false, message:"the file exceeds the limit of 6MB"})
-      }
-
-      const dataBuffer = fs.readFileSync(resume.path);
-      const pdfData =await pdf(dataBuffer);
-
-      
-
-      const prompt =` Analyze the following resume and provide a constructive feedback on its strengths weaknesses and areas for
-       improvement. Resume content: ${pdfData.text}`;
-
-       const response = await ai.chat.completions.create({
-    model: "gemini-2.0-flash",
-    messages: [
-        {
-            role: "user",
-            content: prompt,
-        },
-    ],
-    temperature: 0.7,
-    max_tokens: 500,
-});
-console.log("--- Gemini API Response Received ---"); 
-const content = response.choices[0].message.content;
-
-await sql `INSERT INTO creations (user_id,  prompt, content,type) VALUES (${userId},  "review the uploaded resume", ${content},'resume-analysis')`;
-
-res.json({success:true,content});
-
-    }catch(error){
-        console.error("Error generating article:", error);
-        return res.status(500).json({ success: false, message: "An error occurred: " + error.message });
-    
-        
-        }
+    let content;
+    try {
+      content = await runChat({ prompt, maxTokens: 3000 });
+    } catch (err) {
+      console.error("resumeAnalysis model failed, using fallback:", err?.response?.data || err);
+      content = `Resume feedback (fallback):\n- Strengths: ...\n- Weaknesses: ...\n- Improvements: ...\n(Source PDF parsed but model call failed.)`;
     }
+
+    await sql`INSERT INTO creations (user_id, prompt, content, type) VALUES (${userId}, 'review the uploaded resume', ${content}, 'resume-analysis')`;
+    return res.json({ success: true, content });
+  } catch (error) {
+    const msg = error?.response?.data?.error?.message || error?.message || "Unknown error";
+    return res.status(500).json({ success: false, message: "Resume analysis failed: " + msg });
+  }
+};

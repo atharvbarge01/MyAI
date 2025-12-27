@@ -4,7 +4,7 @@ import { generateArticle, generateBlog, generateImage, removeBackgroundofImage, 
 import { upload } from '../configs/multer.js';
 const aiRouter  = express.Router();
 
-aiRouter.post('/Create-Article', auth, generateArticle);
+aiRouter.post('/Create-Article', auth , generateArticle);
 aiRouter.post('/Create-Blog', auth, generateBlog);
 aiRouter.post('/Create-Image', auth, generateImage);
 aiRouter.post('/Remove-Background', auth, upload.single('image'), removeBackgroundofImage);
